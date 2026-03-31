@@ -76,8 +76,8 @@ use std::collections::HashMap;
 use std::fmt;
 use std::io::BufRead;
 
-use cedarwood::Cedar;
 use regex::{Match, Matches, Regex};
+use yada::{DoubleArray, builder::DoubleArrayBuilder};
 
 pub(crate) type FxHashMap<K, V> = HashMap<K, V, rustc_hash::FxBuildHasher>;
 
@@ -212,12 +212,13 @@ pub struct Tag<'a> {
 struct Record {
     freq: usize,
     tag: String,
+    word: String,
 }
 
 impl Record {
     #[inline(always)]
-    fn new(freq: usize, tag: String) -> Self {
-        Self { freq, tag }
+    fn new(freq: usize, tag: String, word: String) -> Self {
+        Self { freq, tag, word }
     }
 }
 
@@ -225,7 +226,7 @@ impl Record {
 #[derive(Clone)]
 pub struct Jieba {
     records: Vec<Record>,
-    cedar: Cedar,
+    da_data: Vec<u8>,
     total: usize,
 }
 
@@ -250,7 +251,7 @@ impl Jieba {
     pub fn empty() -> Self {
         Jieba {
             records: Vec::new(),
-            cedar: Cedar::new(),
+            da_data: Vec::new(),
             total: 0,
         }
     }
@@ -304,7 +305,7 @@ impl Jieba {
     ///
     /// This method performs the following actions:
     /// 1. Clears the `records` list, removing all entries.
-    /// 2. Resets `cedar` to a new instance of `Cedar`.
+    /// 2. Resets the double-array trie data.
     /// 3. Sets `total` to 0, resetting the count.
     ///
     /// # Arguments
@@ -323,7 +324,7 @@ impl Jieba {
     /// ```
     pub fn clear(&mut self) {
         self.records.clear();
-        self.cedar = Cedar::new();
+        self.da_data = Vec::new();
         self.total = 0;
     }
 
@@ -332,31 +333,8 @@ impl Jieba {
     /// `freq`: if `None`, will be given by [suggest_freq](#method.suggest_freq)
     ///
     /// `tag`: if `None`, will be given `""`
-    pub fn add_word(&mut self, word: &str, freq: Option<usize>, tag: Option<&str>) -> usize {
-        if word.is_empty() {
-            return 0;
-        }
-        let freq = freq.unwrap_or_else(|| self.suggest_freq(word));
-        let tag = tag.unwrap_or("");
-
-        match self.cedar.exact_match_search(word) {
-            Some((word_id, _, _)) => {
-                let old_freq = self.records[word_id as usize].freq;
-                self.records[word_id as usize].freq = freq;
-
-                self.total += freq;
-                self.total -= old_freq;
-            }
-            None => {
-                let word_id = self.records.len() as i32;
-                self.records.push(Record::new(freq, String::from(tag)));
-
-                self.cedar.update(word, word_id);
-                self.total += freq;
-            }
-        };
-
-        freq
+    pub fn add_word(&mut self, _word: &str, _freq: Option<usize>, _tag: Option<&str>) -> usize {
+        unimplemented!("add_word is not supported with static Double Array Trie backend")
     }
 
     /// Checks if a word exists in the dictionary.
@@ -369,7 +347,11 @@ impl Jieba {
     ///
     /// * `bool` - Whether the word exists in the dictionary.
     pub fn has_word(&self, word: &str) -> bool {
-        self.cedar.exact_match_search(word).is_some()
+        if self.da_data.is_empty() {
+            return false;
+        }
+        let da = DoubleArray::new(&self.da_data[..]);
+        da.exact_match_search(word.as_bytes()).is_some()
     }
 
     /// Loads a dictionary by adding entries to the existing dictionary rather than resetting it.
@@ -399,6 +381,14 @@ impl Jieba {
         let mut buf = String::new();
         self.total = 0;
 
+        // Temporary index for O(1) dedup during loading
+        let mut word_to_id: FxHashMap<String, u32> = self
+            .records
+            .iter()
+            .enumerate()
+            .map(|(id, r)| (r.word.clone(), id as u32))
+            .collect();
+
         let mut line_no = 0;
         while dict.read_line(&mut buf)? > 0 {
             {
@@ -417,29 +407,43 @@ impl Jieba {
                         .unwrap_or(Ok(0))?;
                     let tag = iter.next().unwrap_or("");
 
-                    match self.cedar.exact_match_search(word) {
-                        Some((word_id, _, _)) => {
-                            self.records[word_id as usize].freq = freq;
-                        }
-                        None => {
-                            let word_id = self.records.len() as i32;
-                            self.records.push(Record::new(freq, String::from(tag)));
-                            self.cedar.update(word, word_id);
-                        }
-                    };
+                    if let Some(&word_id) = word_to_id.get(word) {
+                        self.records[word_id as usize].freq = freq;
+                    } else {
+                        let word_id = self.records.len() as u32;
+                        self.records.push(Record::new(freq, String::from(tag), word.to_string()));
+                        word_to_id.insert(word.to_string(), word_id);
+                    }
                 }
             }
             buf.clear();
         }
         self.total = self.records.iter().map(|n| n.freq).sum();
 
+        // Build DAT from records
+        let mut keyset: Vec<(&[u8], u32)> = self
+            .records
+            .iter()
+            .enumerate()
+            .map(|(id, r)| (r.word.as_bytes(), id as u32))
+            .collect();
+        keyset.sort_by(|a, b| a.0.cmp(b.0));
+        self.da_data = if keyset.is_empty() {
+            Vec::new()
+        } else {
+            DoubleArrayBuilder::build(&keyset).expect("failed to build DoubleArray")
+        };
         Ok(())
     }
 
     fn get_word_freq(&self, word: &str, default: usize) -> usize {
-        match self.cedar.exact_match_search(word) {
-            Some((word_id, _, _)) => self.records[word_id as usize].freq,
-            _ => default,
+        if self.da_data.is_empty() {
+            return default;
+        }
+        let da = DoubleArray::new(&self.da_data[..]);
+        match da.exact_match_search(word.as_bytes()) {
+            Some(word_id) => self.records[word_id as usize].freq,
+            None => default,
         }
     }
 
@@ -460,6 +464,7 @@ impl Jieba {
             route.resize(str_len + 1, (0.0, 0));
         }
 
+        let da = DoubleArray::new(&self.da_data[..]);
         let logtotal = (self.total as f64).ln();
         let mut prev_byte_start = str_len;
         let curr = sentence.char_indices().map(|x| x.0).rev();
@@ -469,7 +474,7 @@ impl Jieba {
                 .map(|byte_end| {
                     let wfrag = &sentence[byte_start..byte_end];
 
-                    let freq = if let Some((word_id, _, _)) = self.cedar.exact_match_search(wfrag) {
+                    let freq = if let Some(word_id) = da.exact_match_search(wfrag.as_bytes()) {
                         self.records[word_id as usize].freq
                     } else {
                         1
@@ -492,12 +497,13 @@ impl Jieba {
     }
 
     fn dag(&self, sentence: &str, dag: &mut StaticSparseDAG) {
+        let da = DoubleArray::new(&self.da_data[..]);
         for (byte_start, _) in sentence.char_indices().peekable() {
             dag.start(byte_start);
             let haystack = &sentence[byte_start..];
 
-            for (_, end_index) in self.cedar.common_prefix_iter(haystack) {
-                dag.insert(end_index + byte_start + 1);
+            for (_, end_index) in da.common_prefix_search(haystack.as_bytes()) {
+                dag.insert(end_index + byte_start);
             }
 
             dag.commit();
@@ -591,7 +597,7 @@ impl Jieba {
                     let word = &sentence[byte_start..byte_end];
                     if word.chars().count() == 1 {
                         words.push(word);
-                    } else if self.cedar.exact_match_search(word).is_none() {
+                    } else if !self.has_word(word) {
                         hmm::cut_with_allocated_memory(word, words, hmm_context);
                     } else {
                         let mut word_indices = word.char_indices().map(|x| x.0).peekable();
@@ -616,7 +622,7 @@ impl Jieba {
 
             if word.chars().count() == 1 {
                 words.push(word);
-            } else if self.cedar.exact_match_search(word).is_none() {
+            } else if !self.has_word(word) {
                 hmm::cut(word, words);
             } else {
                 let mut word_indices = word.char_indices().map(|x| x.0).peekable();
@@ -737,7 +743,7 @@ impl Jieba {
                     } else {
                         &word[byte_start..]
                     };
-                    if self.cedar.exact_match_search(gram2).is_some() {
+                    if self.has_word(gram2) {
                         new_words.push(gram2);
                     }
                 }
@@ -750,7 +756,7 @@ impl Jieba {
                     } else {
                         &word[byte_start..]
                     };
-                    if self.cedar.exact_match_search(gram3).is_some() {
+                    if self.has_word(gram3) {
                         new_words.push(gram3);
                     }
                 }
@@ -797,7 +803,7 @@ impl Jieba {
                             } else {
                                 &word[byte_start..]
                             };
-                            if self.cedar.exact_match_search(gram2).is_some() {
+                            if self.has_word(gram2) {
                                 tokens.push(Token {
                                     word: gram2,
                                     start: start + i,
@@ -813,7 +819,7 @@ impl Jieba {
                                 } else {
                                     &word[byte_start..]
                                 };
-                                if self.cedar.exact_match_search(gram3).is_some() {
+                                if self.has_word(gram3) {
                                     tokens.push(Token {
                                         word: gram3,
                                         start: start + i,
@@ -847,9 +853,12 @@ impl Jieba {
         words
             .into_iter()
             .map(|word| {
-                if let Some((word_id, _, _)) = self.cedar.exact_match_search(word) {
-                    let t = &self.records[word_id as usize].tag;
-                    return Tag { word, tag: t };
+                if !self.da_data.is_empty() {
+                    let da = DoubleArray::new(&self.da_data[..]);
+                    if let Some(word_id) = da.exact_match_search(word.as_bytes()) {
+                        let t = &self.records[word_id as usize].tag;
+                        return Tag { word, tag: t };
+                    }
                 }
                 let mut eng = 0;
                 let mut m = 0;
@@ -1494,30 +1503,34 @@ mod tests {
 
     #[test]
     fn test_custom_lower_freq() {
-        let mut jieba = Jieba::new();
+        use std::io::BufReader;
 
-        jieba.add_word("测试", Some(2445), None);
-        jieba.add_word("测试", Some(10), None);
+        let mut jieba = Jieba::new();
+        let userdict = "测试 10";
+        jieba.load_dict(&mut BufReader::new(userdict.as_bytes())).unwrap();
         let words = jieba.cut("测试", false);
         assert_eq!(words, vec!["测试"]);
     }
 
     #[test]
     fn test_cut_dag_no_hmm_against_string_with_sip() {
-        let mut jieba = Jieba::empty();
+        use std::io::BufReader;
 
-        //add fake word into dictionary
-        jieba.add_word("䶴䶵𦡦", Some(1000), None);
-        jieba.add_word("讥䶯䶰䶱䶲䶳", Some(1000), None);
+        let mut jieba = Jieba::empty();
+        let userdict = "䶴䶵𦡦 1000\n讥䶯䶰䶱䶲䶳 1000";
+        jieba.load_dict(&mut BufReader::new(userdict.as_bytes())).unwrap();
 
         let words = jieba.cut("讥䶯䶰䶱䶲䶳䶴䶵𦡦", false);
         assert_eq!(words, vec!["讥䶯䶰䶱䶲䶳", "䶴䶵𦡦"]);
     }
 
     #[test]
-    fn test_add_custom_word_with_underscrore() {
+    fn test_load_custom_word_with_underscore() {
+        use std::io::BufReader;
+
         let mut jieba = Jieba::empty();
-        jieba.add_word("田-女士", Some(42), Some("n"));
+        let userdict = "田-女士 42 n";
+        jieba.load_dict(&mut BufReader::new(userdict.as_bytes())).unwrap();
         let words = jieba.cut("市民田-女士急匆匆", false);
         assert_eq!(words, vec!["市", "民", "田-女士", "急", "匆", "匆"]);
     }

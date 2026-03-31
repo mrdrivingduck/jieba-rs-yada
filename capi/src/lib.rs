@@ -459,12 +459,12 @@ pub unsafe extern "C" fn jieba_tags_free(c_tags: *mut CJiebaTags) {
 
 /// # Safety
 /// cjieba must be valid object from `jieba_new()`. `word` must be `len` or larger.
+///
+/// NOTE: This function is no longer supported with the static Double Array Trie backend.
+/// It always returns 0.
 #[unsafe(no_mangle)]
-pub unsafe extern "C" fn jieba_add_word(cjieba: *mut CJieba, word: *const c_char, len: usize) -> usize {
-    let (jieba, c_str) = unsafe { params_unwrap_mut(&cjieba, word, len) };
-    // FIXME: remove allocation
-    let s = String::from_utf8_lossy(c_str.as_bytes_full());
-    jieba.add_word(&s, None, None)
+pub unsafe extern "C" fn jieba_add_word(_cjieba: *mut CJieba, _word: *const c_char, _len: usize) -> usize {
+    0
 }
 
 /// # Safety
@@ -496,12 +496,13 @@ mod test {
     }
 
     #[test]
-    fn test_jieba_add_word() {
+    fn test_jieba_add_word_noop() {
         let jieba = jieba_empty();
         let word = "今天";
         let c_word = CString::new(word).unwrap();
         unsafe {
-            jieba_add_word(jieba, c_word.as_ptr(), word.len());
+            let result = jieba_add_word(jieba, c_word.as_ptr(), word.len());
+            assert_eq!(result, 0, "add_word should return 0 (not supported)");
             jieba_free(jieba)
         };
     }

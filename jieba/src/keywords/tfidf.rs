@@ -51,7 +51,7 @@ impl TfIdf {
     ///
     /// New instance with custom idf dictionary.
     /// ```
-    ///    use jieba_rs::{TfIdf, KeywordExtractConfig};
+    ///    use jieba_rs_yada::{TfIdf, KeywordExtractConfig};
     ///
     ///    let mut sample_idf = "劳动防护 13.900677652\n\
     ///        生化学 13.900677652\n";
@@ -63,7 +63,7 @@ impl TfIdf {
     /// New instance with module default stop words and no initial IDF
     /// dictionary. Dictionary should be loaded later with `load_dict()` calls.
     /// ```
-    ///    use jieba_rs::{TfIdf, KeywordExtractConfig};
+    ///    use jieba_rs_yada::{TfIdf, KeywordExtractConfig};
     ///
     ///    TfIdf::new(
     ///        None::<&mut std::io::Empty>,
@@ -84,7 +84,7 @@ impl TfIdf {
     /// Merges entries from `dict` into the `idf_dict`.
     ///
     /// ```
-    /// use jieba_rs::{Jieba, KeywordExtract, Keyword, KeywordExtractConfig, TfIdf};
+    /// use jieba_rs_yada::{Jieba, KeywordExtract, Keyword, KeywordExtractConfig, TfIdf};
     ///
     /// let jieba = Jieba::default();
     /// let mut init_idf = "生化学 13.900677652\n";
@@ -170,7 +170,7 @@ impl KeywordExtract for TfIdf {
     /// # Examples
     ///
     /// ```
-    /// use jieba_rs::{Jieba, KeywordExtract, TfIdf};
+    /// use jieba_rs_yada::{Jieba, KeywordExtract, TfIdf};
     ///
     /// let jieba = Jieba::new();
     /// let keyword_extractor = TfIdf::default();

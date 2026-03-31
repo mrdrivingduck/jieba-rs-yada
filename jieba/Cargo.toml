@@ -1,9 +1,9 @@
 [package]
-name = "jieba-rs"
-version = "0.8.0"
+name = "jieba-rs-yada"
+version = "0.1.0"
 
 categories = ["text-processing"]
-description = "Jieba Chinese Word Segmentation in Rust"
+description = "Jieba Chinese Word Segmentation in Rust (yada-based fork)"
 keywords = ["nlp", "chinese", "segmentation"]
 
 edition.workspace = true

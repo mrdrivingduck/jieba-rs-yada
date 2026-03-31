@@ -6,7 +6,7 @@ version = "0.1.0"
 edition.workspace = true
 
 [dependencies]
-jieba-rs = { workspace = true }
+jieba-rs-yada = { workspace = true }
 
 [target.'cfg(unix)'.dependencies]
 tikv-jemallocator = "0.6.0"

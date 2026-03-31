@@ -87,7 +87,7 @@ impl TextRank {
     ///
     /// ```
     /// use std::collections::BTreeSet;
-    /// use jieba_rs::{TextRank, KeywordExtractConfig};
+    /// use jieba_rs_yada::{TextRank, KeywordExtractConfig};
     ///
     /// let stop_words : BTreeSet<String> =
     ///     BTreeSet::from(["a", "the", "of"].map(|s| s.to_string()));
@@ -115,7 +115,7 @@ impl KeywordExtract for TextRank {
     /// # Examples
     ///
     /// ```
-    /// use jieba_rs::{Jieba, KeywordExtract, TextRank};
+    /// use jieba_rs_yada::{Jieba, KeywordExtract, TextRank};
     ///
     /// let jieba = Jieba::new();
     /// let keyword_extractor = TextRank::default();

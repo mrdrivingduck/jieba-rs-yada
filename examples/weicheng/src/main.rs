@@ -1,4 +1,4 @@
-use jieba_rs::Jieba;
+use jieba_rs_yada::Jieba;
 use std::time;
 
 #[cfg(unix)]

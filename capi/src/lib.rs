@@ -1,5 +1,5 @@
 use c_fixed_string::CFixedStr;
-use jieba_rs::{Jieba, KeywordExtract, TextRank, TfIdf};
+use jieba_rs_yada::{Jieba, KeywordExtract, TextRank, TfIdf};
 use std::boxed::Box;
 use std::os::raw::c_char;
 use std::{mem, ptr};
@@ -45,11 +45,11 @@ pub enum TokenizeMode {
     Search = 1,
 }
 
-impl From<TokenizeMode> for jieba_rs::TokenizeMode {
+impl From<TokenizeMode> for jieba_rs_yada::TokenizeMode {
     fn from(mode: TokenizeMode) -> Self {
         match mode {
-            TokenizeMode::Default => jieba_rs::TokenizeMode::Default,
-            TokenizeMode::Search => jieba_rs::TokenizeMode::Search,
+            TokenizeMode::Default => jieba_rs_yada::TokenizeMode::Default,
+            TokenizeMode::Search => jieba_rs_yada::TokenizeMode::Search,
         }
     }
 }

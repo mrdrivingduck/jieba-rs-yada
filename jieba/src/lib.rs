@@ -6,15 +6,15 @@
 //!
 //! ```toml
 //! [dependencies]
-//! jieba-rs = "0.7"
+//! jieba-rs-yada = "0.1"
 //! ```
 //!
-//! then you are good to go. If you are using Rust 2015 you have to ``extern crate jieba_rs`` to your crate root as well.
+//! then you are good to go. If you are using Rust 2015 you have to ``extern crate jieba_rs_yada`` to your crate root as well.
 //!
 //! ## Example
 //!
 //! ```rust
-//! use jieba_rs::Jieba;
+//! use jieba_rs_yada::Jieba;
 //!
 //! let jieba = Jieba::new();
 //! let words = jieba.cut("我们中出了一个叛徒", false);
@@ -23,8 +23,8 @@
 //!
 //! ```rust
 //! # #[cfg(feature = "tfidf")] {
-//! use jieba_rs::Jieba;
-//! use jieba_rs::{TfIdf, KeywordExtract};
+//! use jieba_rs_yada::Jieba;
+//! use jieba_rs_yada::{TfIdf, KeywordExtract};
 //!
 //! fn main() {
 //!     let jieba = Jieba::new();
@@ -42,8 +42,8 @@
 //!
 //! ```rust
 //! # #[cfg(feature = "textrank")] {
-//! use jieba_rs::Jieba;
-//! use jieba_rs::{TextRank, KeywordExtract};
+//! use jieba_rs_yada::Jieba;
+//! use jieba_rs_yada::{TextRank, KeywordExtract};
 //!
 //! fn main() {
 //!     let jieba = Jieba::new();
@@ -67,7 +67,7 @@
 //!
 //! ```toml
 //! [dependencies]
-//! jieba-rs = { version = "0.7", features = ["tfidf", "textrank"] }
+//! jieba-rs-yada = { version = "0.1", features = ["tfidf", "textrank"] }
 //! ```
 //!
 
@@ -286,7 +286,7 @@ impl Jieba {
     /// # Examples
     ///
     /// ```
-    /// use jieba_rs::Jieba;
+    /// use jieba_rs_yada::Jieba;
     ///
     /// let mut instance = Jieba::empty();
     /// instance.load_default_dict(); // Loads the default dictionary into the instance
@@ -314,7 +314,7 @@ impl Jieba {
     /// # Examples
     ///
     /// ```
-    /// use jieba_rs::Jieba;
+    /// use jieba_rs_yada::Jieba;
     ///
     /// let mut instance = Jieba::new();
     /// assert!(instance.has_word("我们"), "The word '我们' should be in the dictionary after loading the default dictionary");

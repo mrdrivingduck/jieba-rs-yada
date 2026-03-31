@@ -1,5 +1,5 @@
 use codspeed_criterion_compat::{Criterion, Throughput, black_box, criterion_group, criterion_main};
-use jieba_rs::{Jieba, KeywordExtract, TextRank, TfIdf, TokenizeMode};
+use jieba_rs_yada::{Jieba, KeywordExtract, TextRank, TfIdf, TokenizeMode};
 use rayon::iter::{IntoParallelIterator, ParallelIterator};
 use std::sync::LazyLock;
 

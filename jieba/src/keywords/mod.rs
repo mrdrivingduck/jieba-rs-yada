@@ -34,7 +34,7 @@ pub struct Keyword {
 /// # Examples
 ///
 /// ```
-/// use jieba_rs::KeywordExtractConfig;
+/// use jieba_rs_yada::KeywordExtractConfig;
 ///
 /// let mut config = KeywordExtractConfig::default();
 /// assert!(config.stop_words().contains("the"));
@@ -141,7 +141,7 @@ impl KeywordExtractConfigBuilder {
     /// # Examples
     ///
     /// ```
-    /// use jieba_rs::KeywordExtractConfig;
+    /// use jieba_rs_yada::KeywordExtractConfig;
     /// use std::collections::BTreeSet;
     ///
     /// let populates_default = KeywordExtractConfig::builder()
@@ -181,7 +181,7 @@ impl KeywordExtractConfigBuilder {
     /// # Examples
     ///
     /// ```
-    /// use jieba_rs::KeywordExtractConfig;
+    /// use jieba_rs_yada::KeywordExtractConfig;
     /// use std::collections::BTreeSet;
     ///
     /// let populates_default = KeywordExtractConfig::builder()
@@ -211,7 +211,7 @@ impl KeywordExtractConfigBuilder {
     /// # Examples
     ///
     /// ```
-    /// use jieba_rs::KeywordExtractConfig;
+    /// use jieba_rs_yada::KeywordExtractConfig;
     /// use std::collections::BTreeSet;
     ///
     /// let no_default_if_set = KeywordExtractConfig::builder()

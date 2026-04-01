@@ -20,7 +20,7 @@ memmap2 = { version = "0.9" }
 libc = { version = "0.2" }
 codspeed-criterion-compat = { version = "3.0.5" }
 rustc-hash = { version = "2.1" }
-include-flate = { version = "0.3.1" }
+include-flate = { version = "0.3" }
 ordered-float = { version = "5.0" }
 phf = { version = "0.13.1" }
 phf_codegen = { version = "0.13.1" }

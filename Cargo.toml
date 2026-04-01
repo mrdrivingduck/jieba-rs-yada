@@ -1,6 +1,6 @@
 [workspace]
 resolver = "3"
-members = ["capi", "jieba", "jieba-macros", "examples/weicheng"]
+members = ["capi", "jieba", "jieba-macros", "examples/weicheng", "examples/multiprocess"]
 
 [workspace.package]
 edition = "2024"

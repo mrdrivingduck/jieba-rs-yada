@@ -16,6 +16,8 @@ jieba-macros = { version = "0.8.0", path = "jieba-macros" }
 # Crates.io dependencies
 c_fixed_string = { version = "0.2" }
 yada = { version = "0.5" }
+memmap2 = { version = "0.9" }
+libc = { version = "0.2" }
 codspeed-criterion-compat = { version = "3.0.5" }
 rustc-hash = { version = "2.1" }
 include-flate = { version = "0.3.1" }

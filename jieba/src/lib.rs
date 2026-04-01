@@ -75,7 +75,10 @@ use std::cmp::Ordering;
 use std::collections::HashMap;
 use std::fmt;
 use std::io::BufRead;
+use std::path::Path;
+use std::sync::Arc;
 
+use memmap2::Mmap;
 use regex::{Match, Matches, Regex};
 use yada::{DoubleArray, builder::DoubleArrayBuilder};
 
@@ -222,18 +225,168 @@ impl Record {
     }
 }
 
+/// Backing storage for dictionary records.
+///
+/// Supports two modes:
+/// - `Owned`: records live in heap-allocated `Vec<Record>` (used during construction via `new()`)
+/// - `Mapped`: records are zero-copy references into a memory-mapped cache file, shared across
+///   processes through the OS page cache
+#[derive(Clone)]
+enum RecordStore {
+    Owned(Vec<Record>),
+    Mapped {
+        /// Shared mmap handle (same `Arc<Mmap>` as `DaData::Mapped`)
+        mmap: Arc<Mmap>,
+        /// Number of records
+        count: usize,
+        /// Byte offset in the mmap where the freq array `[u64; count]` starts
+        freq_offset: usize,
+        /// Byte offset in the mmap where the tag index `[(u32, u32); count]` starts
+        tag_index_offset: usize,
+        /// Byte offset in the mmap where the word index `[(u32, u32); count]` starts
+        #[allow(dead_code)]
+        word_index_offset: usize,
+        /// Byte offset in the mmap where the strings blob starts
+        strings_offset: usize,
+    },
+}
+
+impl RecordStore {
+    #[allow(dead_code)]
+    fn len(&self) -> usize {
+        match self {
+            RecordStore::Owned(v) => v.len(),
+            RecordStore::Mapped { count, .. } => *count,
+        }
+    }
+
+    #[inline]
+    fn freq(&self, word_id: usize) -> usize {
+        match self {
+            RecordStore::Owned(v) => v[word_id].freq,
+            RecordStore::Mapped { mmap, freq_offset, .. } => {
+                let offset = *freq_offset + word_id * 8;
+                u64::from_le_bytes(mmap[offset..offset + 8].try_into().unwrap()) as usize
+            }
+        }
+    }
+
+    #[inline]
+    fn tag(&self, word_id: usize) -> &str {
+        match self {
+            RecordStore::Owned(v) => &v[word_id].tag,
+            RecordStore::Mapped { mmap, tag_index_offset, strings_offset, .. } => {
+                let idx_offset = *tag_index_offset + word_id * 8;
+                let str_off = u32::from_le_bytes(mmap[idx_offset..idx_offset + 4].try_into().unwrap()) as usize;
+                let str_len = u32::from_le_bytes(mmap[idx_offset + 4..idx_offset + 8].try_into().unwrap()) as usize;
+                let abs_offset = *strings_offset + str_off;
+                std::str::from_utf8(&mmap[abs_offset..abs_offset + str_len]).unwrap()
+            }
+        }
+    }
+
+    #[inline]
+    #[allow(dead_code)]
+    fn word(&self, word_id: usize) -> &str {
+        match self {
+            RecordStore::Owned(v) => &v[word_id].word,
+            RecordStore::Mapped { mmap, word_index_offset, strings_offset, .. } => {
+                let idx_offset = *word_index_offset + word_id * 8;
+                let str_off = u32::from_le_bytes(mmap[idx_offset..idx_offset + 4].try_into().unwrap()) as usize;
+                let str_len = u32::from_le_bytes(mmap[idx_offset + 4..idx_offset + 8].try_into().unwrap()) as usize;
+                let abs_offset = *strings_offset + str_off;
+                std::str::from_utf8(&mmap[abs_offset..abs_offset + str_len]).unwrap()
+            }
+        }
+    }
+}
+
+impl fmt::Debug for RecordStore {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            RecordStore::Owned(v) => write!(f, "RecordStore::Owned({} records)", v.len()),
+            RecordStore::Mapped { count, .. } => write!(f, "RecordStore::Mapped({count} records)"),
+        }
+    }
+}
+
+/// Backing storage for the Double Array Trie data.
+///
+/// Supports two modes:
+/// - `Owned`: data lives in a heap-allocated `Vec<u8>` (used during construction)
+/// - `Mapped`: data is memory-mapped from a file via `Arc<Mmap>` (used for multi-process sharing)
+#[derive(Clone)]
+enum DaData {
+    Owned(Vec<u8>),
+    Mapped {
+        mmap: Arc<Mmap>,
+        offset: usize,
+        length: usize,
+    },
+}
+
+impl DaData {
+    fn as_slice(&self) -> &[u8] {
+        match self {
+            DaData::Owned(v) => v.as_slice(),
+            DaData::Mapped { mmap, offset, length } => &mmap[*offset..*offset + *length],
+        }
+    }
+
+    fn is_empty(&self) -> bool {
+        self.as_slice().is_empty()
+    }
+}
+
+impl fmt::Debug for DaData {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            DaData::Owned(v) => write!(f, "DaData::Owned({} bytes)", v.len()),
+            DaData::Mapped { offset, length, .. } => {
+                write!(f, "DaData::Mapped(offset={offset}, length={length})")
+            }
+        }
+    }
+}
+
+/// Cache file format constants
+const CACHE_MAGIC: &[u8; 4] = b"JBDA";
+const CACHE_VERSION: u32 = 2;
+
+/// Header v2 layout (little-endian):
+///
+/// | Field            | Size    | Description                                       |
+/// |------------------|---------|---------------------------------------------------|
+/// | magic            | 4 bytes | `b"JBDA"`                                         |
+/// | version          | 4 bytes | format version (`2`)                              |
+/// | total            | 8 bytes | sum of all word frequencies                       |
+/// | records_count    | 4 bytes | number of dictionary entries                      |
+/// | da_data_offset   | 8 bytes | byte offset where DAT data begins                 |
+///
+/// After the header, the records region contains (all contiguous, zero-copy friendly):
+///
+/// | Section          | Size                  | Description                              |
+/// |------------------|-----------------------|------------------------------------------|
+/// | freq_array       | 8 × N                | `[u64; N]` word frequencies              |
+/// | tag_index        | 8 × N                | `[(u32 offset, u32 len); N]` tag refs    |
+/// | word_index       | 8 × N                | `[(u32 offset, u32 len); N]` word refs   |
+/// | strings_blob     | variable              | raw UTF-8 bytes for all tags and words   |
+///
+/// Then the DAT data follows at `da_data_offset`.
+const CACHE_HEADER_SIZE: usize = 28;
+
 /// Jieba segmentation
 #[derive(Clone)]
 pub struct Jieba {
-    records: Vec<Record>,
-    da_data: Vec<u8>,
+    record_store: RecordStore,
+    da_data: DaData,
     total: usize,
 }
 
 impl fmt::Debug for Jieba {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         f.debug_struct("Jieba")
-            .field("records_len", &self.records.len())
+            .field("record_store", &self.record_store)
             .field("total_freq", &self.total)
             .finish()
     }
@@ -250,9 +403,27 @@ impl Jieba {
     /// Create a new instance with empty dict
     pub fn empty() -> Self {
         Jieba {
-            records: Vec::new(),
-            da_data: Vec::new(),
+            record_store: RecordStore::Owned(Vec::new()),
+            da_data: DaData::Owned(Vec::new()),
             total: 0,
+        }
+    }
+
+    /// Returns a mutable reference to the owned records vector.
+    /// Panics if the record store is in Mapped mode.
+    fn records_mut(&mut self) -> &mut Vec<Record> {
+        match &mut self.record_store {
+            RecordStore::Owned(v) => v,
+            RecordStore::Mapped { .. } => panic!("cannot mutate records in mmap mode"),
+        }
+    }
+
+    /// Returns a reference to the owned records vector.
+    /// Panics if the record store is in Mapped mode.
+    fn records(&self) -> &Vec<Record> {
+        match &self.record_store {
+            RecordStore::Owned(v) => v,
+            RecordStore::Mapped { .. } => panic!("cannot access owned records in mmap mode"),
         }
     }
 
@@ -323,8 +494,8 @@ impl Jieba {
     /// assert!(!instance.has_word("我们"), "The word '我们' should not be in the dictionary after clearing the dictionary");
     /// ```
     pub fn clear(&mut self) {
-        self.records.clear();
-        self.da_data = Vec::new();
+        self.record_store = RecordStore::Owned(Vec::new());
+        self.da_data = DaData::Owned(Vec::new());
         self.total = 0;
     }
 
@@ -350,7 +521,7 @@ impl Jieba {
         if self.da_data.is_empty() {
             return false;
         }
-        let da = DoubleArray::new(&self.da_data[..]);
+        let da = DoubleArray::new(self.da_data.as_slice());
         da.exact_match_search(word.as_bytes()).is_some()
     }
 
@@ -382,8 +553,8 @@ impl Jieba {
         self.total = 0;
 
         // Temporary index for O(1) dedup during loading
-        let mut word_to_id: FxHashMap<String, u32> = self
-            .records
+        let records = self.records_mut();
+        let mut word_to_id: FxHashMap<String, u32> = records
             .iter()
             .enumerate()
             .map(|(id, r)| (r.word.clone(), id as u32))
@@ -408,31 +579,334 @@ impl Jieba {
                     let tag = iter.next().unwrap_or("");
 
                     if let Some(&word_id) = word_to_id.get(word) {
-                        self.records[word_id as usize].freq = freq;
+                        records[word_id as usize].freq = freq;
                     } else {
-                        let word_id = self.records.len() as u32;
-                        self.records.push(Record::new(freq, String::from(tag), word.to_string()));
+                        let word_id = records.len() as u32;
+                        records.push(Record::new(freq, String::from(tag), word.to_string()));
                         word_to_id.insert(word.to_string(), word_id);
                     }
                 }
             }
             buf.clear();
         }
-        self.total = self.records.iter().map(|n| n.freq).sum();
+        self.total = self.records().iter().map(|n| n.freq).sum();
 
         // Build DAT from records
         let mut keyset: Vec<(&[u8], u32)> = self
-            .records
+            .records()
             .iter()
             .enumerate()
             .map(|(id, r)| (r.word.as_bytes(), id as u32))
             .collect();
         keyset.sort_by(|a, b| a.0.cmp(b.0));
         self.da_data = if keyset.is_empty() {
-            Vec::new()
+            DaData::Owned(Vec::new())
         } else {
-            DoubleArrayBuilder::build(&keyset).expect("failed to build DoubleArray")
+            DaData::Owned(DoubleArrayBuilder::build(&keyset).expect("failed to build DoubleArray"))
         };
+        Ok(())
+    }
+
+    /// Save the dictionary cache to a file for later mmap-based loading.
+    ///
+    /// The file is written atomically using a write-to-temp-then-rename strategy,
+    /// which is safe for concurrent multi-process access: readers will either see
+    /// the complete old file or the complete new file, never a partially-written one.
+    ///
+    /// ## File format (little-endian)
+    ///
+    /// ## Example
+    ///
+    /// ```no_run
+    /// use jieba_rs_yada::Jieba;
+    ///
+    /// let jieba = Jieba::new();
+    /// jieba.save_cache("/tmp/jieba.dict.cache").unwrap();
+    /// ```
+    pub fn save_cache<P: AsRef<Path>>(&self, path: P) -> Result<(), Error> {
+        use std::io::Write;
+
+        let path = path.as_ref();
+        let tmp_path = path.with_extension(format!("tmp.{}", std::process::id()));
+
+        let records = self.records();
+        let da_slice = self.da_data.as_slice();
+
+        // Build the strings blob and index tables for tags and words
+        let record_count = records.len();
+        let mut strings_blob: Vec<u8> = Vec::new();
+        let mut tag_index: Vec<(u32, u32)> = Vec::with_capacity(record_count);
+        let mut word_index: Vec<(u32, u32)> = Vec::with_capacity(record_count);
+
+        for record in records {
+            let tag_offset = strings_blob.len() as u32;
+            strings_blob.extend_from_slice(record.tag.as_bytes());
+            let tag_len = record.tag.len() as u32;
+            tag_index.push((tag_offset, tag_len));
+
+            let word_offset = strings_blob.len() as u32;
+            strings_blob.extend_from_slice(record.word.as_bytes());
+            let word_len = record.word.len() as u32;
+            word_index.push((word_offset, word_len));
+        }
+
+        // Records region: freq_array + tag_index + word_index + strings_blob
+        let freq_array_size = record_count * 8;
+        let tag_index_size = record_count * 8;
+        let word_index_size = record_count * 8;
+        let records_size = freq_array_size + tag_index_size + word_index_size + strings_blob.len();
+        let da_data_offset = (CACHE_HEADER_SIZE + records_size) as u64;
+
+        // Write to temporary file
+        let mut file = std::fs::File::create(&tmp_path).map_err(|e| {
+            Error::InvalidDictEntry(format!("failed to create cache file {}: {e}", tmp_path.display()))
+        })?;
+
+        let write_err = |e: std::io::Error, context: &str| -> Error {
+            Error::InvalidDictEntry(format!("failed to write {context}: {e}"))
+        };
+
+        // Header
+        file.write_all(CACHE_MAGIC).map_err(|e| write_err(e, "cache magic"))?;
+        file.write_all(&CACHE_VERSION.to_le_bytes()).map_err(|e| write_err(e, "cache version"))?;
+        file.write_all(&(self.total as u64).to_le_bytes()).map_err(|e| write_err(e, "total"))?;
+        file.write_all(&(record_count as u32).to_le_bytes())
+            .map_err(|e| write_err(e, "records count"))?;
+        file.write_all(&da_data_offset.to_le_bytes()).map_err(|e| write_err(e, "da_data_offset"))?;
+
+        // freq_array: [u64; N]
+        for record in records {
+            file.write_all(&(record.freq as u64).to_le_bytes())
+                .map_err(|e| write_err(e, "record freq"))?;
+        }
+
+        // tag_index: [(u32 offset, u32 len); N]
+        for &(offset, len) in &tag_index {
+            file.write_all(&offset.to_le_bytes()).map_err(|e| write_err(e, "tag offset"))?;
+            file.write_all(&len.to_le_bytes()).map_err(|e| write_err(e, "tag len"))?;
+        }
+
+        // word_index: [(u32 offset, u32 len); N]
+        for &(offset, len) in &word_index {
+            file.write_all(&offset.to_le_bytes()).map_err(|e| write_err(e, "word offset"))?;
+            file.write_all(&len.to_le_bytes()).map_err(|e| write_err(e, "word len"))?;
+        }
+
+        // strings_blob
+        file.write_all(&strings_blob).map_err(|e| write_err(e, "strings blob"))?;
+
+        // DAT data
+        file.write_all(da_slice).map_err(|e| write_err(e, "DAT data"))?;
+
+        file.flush().map_err(|e| write_err(e, "flush"))?;
+        drop(file);
+
+        // Atomic rename: safe for concurrent readers
+        std::fs::rename(&tmp_path, path).map_err(|e| {
+            Error::InvalidDictEntry(format!(
+                "failed to rename {} -> {}: {e}",
+                tmp_path.display(),
+                path.display()
+            ))
+        })?;
+
+        Ok(())
+    }
+
+    /// Load a Jieba instance from a previously saved cache file using mmap.
+    ///
+    /// The DAT portion of the file is memory-mapped, so multiple processes that
+    /// load the same cache file will **share the same physical memory pages**
+    /// through the OS page cache, significantly reducing memory usage.
+    ///
+    /// ## Multi-process safety
+    ///
+    /// If the cache file does not yet exist, this method will:
+    /// 1. Acquire an exclusive file lock on a `.lock` sidecar file.
+    /// 2. Double-check whether another process has created the cache in the meantime.
+    /// 3. If not, build the dictionary from the default dict and write the cache.
+    /// 4. Release the lock so waiting processes can proceed.
+    ///
+    /// Processes that arrive while the lock is held will block until the cache is
+    /// ready, then mmap it directly.
+    ///
+    /// ## Example
+    ///
+    /// ```no_run
+    /// use jieba_rs_yada::Jieba;
+    ///
+    /// let jieba = Jieba::load_from_cache("/tmp/jieba.dict.cache").unwrap();
+    /// let words = jieba.cut("测试分词", false);
+    /// ```
+    pub fn load_from_cache<P: AsRef<Path>>(path: P) -> Result<Self, Error> {
+        let path = path.as_ref();
+
+        // If cache exists, load it directly
+        if path.exists() {
+            return Self::mmap_load(path);
+        }
+
+        // Cache doesn't exist — coordinate with other processes via file lock
+        let lock_path = path.with_extension("lock");
+        let lock_file = std::fs::OpenOptions::new()
+            .create(true)
+            .write(true)
+            .truncate(false)
+            .open(&lock_path)
+            .map_err(|e| {
+                Error::InvalidDictEntry(format!("failed to open lock file {}: {e}", lock_path.display()))
+            })?;
+
+        // Acquire exclusive lock (blocks until available)
+        Self::flock_exclusive(&lock_file)?;
+
+        // Double-check: another process may have created the cache while we waited
+        let result = if path.exists() {
+            Self::mmap_load(path)
+        } else {
+            // We are the builder — construct and save
+            let instance = Self::new();
+            instance.save_cache(path)?;
+            // Now mmap-load the file we just wrote
+            Self::mmap_load(path)
+        };
+
+        // Release lock
+        Self::flock_unlock(&lock_file)?;
+        drop(lock_file);
+
+        result
+    }
+
+    /// Memory-map a cache file and construct a Jieba instance from it.
+    ///
+    /// All data (freq, tag, word, DAT) remains in the mmap region and is
+    /// referenced zero-copy. Multiple processes mapping the same file share
+    /// the same physical memory pages through the OS page cache.
+    fn mmap_load(path: &Path) -> Result<Self, Error> {
+        let file = std::fs::File::open(path).map_err(|e| {
+            Error::InvalidDictEntry(format!("failed to open cache file {}: {e}", path.display()))
+        })?;
+
+        let mmap = unsafe { Mmap::map(&file) }.map_err(|e| {
+            Error::InvalidDictEntry(format!("failed to mmap cache file {}: {e}", path.display()))
+        })?;
+
+        let data = &mmap[..];
+        if data.len() < CACHE_HEADER_SIZE {
+            return Err(Error::InvalidDictEntry("cache file too small".into()));
+        }
+
+        // Parse header
+        if &data[0..4] != CACHE_MAGIC {
+            return Err(Error::InvalidDictEntry("invalid cache magic".into()));
+        }
+        let version = u32::from_le_bytes(data[4..8].try_into().unwrap());
+        if version != CACHE_VERSION {
+            return Err(Error::InvalidDictEntry(format!(
+                "unsupported cache version {version}, expected {CACHE_VERSION}"
+            )));
+        }
+        let total = u64::from_le_bytes(data[8..16].try_into().unwrap()) as usize;
+        let records_count = u32::from_le_bytes(data[16..20].try_into().unwrap()) as usize;
+        let da_data_offset = u64::from_le_bytes(data[20..28].try_into().unwrap()) as usize;
+
+        if da_data_offset > data.len() {
+            return Err(Error::InvalidDictEntry("da_data_offset exceeds file size".into()));
+        }
+
+        // Validate records region layout:
+        //   freq_array:  [u64; N]           at CACHE_HEADER_SIZE
+        //   tag_index:   [(u32, u32); N]    at CACHE_HEADER_SIZE + 8*N
+        //   word_index:  [(u32, u32); N]    at CACHE_HEADER_SIZE + 16*N
+        //   strings_blob:                   at CACHE_HEADER_SIZE + 24*N
+        let freq_offset = CACHE_HEADER_SIZE;
+        let tag_index_offset = freq_offset + records_count * 8;
+        let word_index_offset = tag_index_offset + records_count * 8;
+        let strings_offset = word_index_offset + records_count * 8;
+
+        if strings_offset > da_data_offset {
+            return Err(Error::InvalidDictEntry("records index tables exceed da_data_offset".into()));
+        }
+
+        // Validate that strings referenced by tag/word indices are within bounds
+        let strings_region_len = da_data_offset - strings_offset;
+        for i in 0..records_count {
+            // Validate tag index entry
+            let ti_off = tag_index_offset + i * 8;
+            let tag_str_off = u32::from_le_bytes(data[ti_off..ti_off + 4].try_into().unwrap()) as usize;
+            let tag_str_len = u32::from_le_bytes(data[ti_off + 4..ti_off + 8].try_into().unwrap()) as usize;
+            if tag_str_off + tag_str_len > strings_region_len {
+                return Err(Error::InvalidDictEntry(format!(
+                    "tag string for record {i} exceeds strings region"
+                )));
+            }
+
+            // Validate word index entry
+            let wi_off = word_index_offset + i * 8;
+            let word_str_off = u32::from_le_bytes(data[wi_off..wi_off + 4].try_into().unwrap()) as usize;
+            let word_str_len = u32::from_le_bytes(data[wi_off + 4..wi_off + 8].try_into().unwrap()) as usize;
+            if word_str_off + word_str_len > strings_region_len {
+                return Err(Error::InvalidDictEntry(format!(
+                    "word string for record {i} exceeds strings region"
+                )));
+            }
+        }
+
+        let da_data_length = data.len() - da_data_offset;
+        let mmap_arc = Arc::new(mmap);
+
+        Ok(Jieba {
+            record_store: RecordStore::Mapped {
+                mmap: Arc::clone(&mmap_arc),
+                count: records_count,
+                freq_offset,
+                tag_index_offset,
+                word_index_offset,
+                strings_offset,
+            },
+            da_data: DaData::Mapped {
+                mmap: mmap_arc,
+                offset: da_data_offset,
+                length: da_data_length,
+            },
+            total,
+        })
+    }
+
+    #[cfg(unix)]
+    fn flock_exclusive(file: &std::fs::File) -> Result<(), Error> {
+        use std::os::unix::io::AsRawFd;
+        let result = unsafe { libc::flock(file.as_raw_fd(), libc::LOCK_EX) };
+        if result != 0 {
+            return Err(Error::InvalidDictEntry(format!(
+                "flock(LOCK_EX) failed: {}",
+                std::io::Error::last_os_error()
+            )));
+        }
+        Ok(())
+    }
+
+    #[cfg(unix)]
+    fn flock_unlock(file: &std::fs::File) -> Result<(), Error> {
+        use std::os::unix::io::AsRawFd;
+        let result = unsafe { libc::flock(file.as_raw_fd(), libc::LOCK_UN) };
+        if result != 0 {
+            return Err(Error::InvalidDictEntry(format!(
+                "flock(LOCK_UN) failed: {}",
+                std::io::Error::last_os_error()
+            )));
+        }
+        Ok(())
+    }
+
+    #[cfg(not(unix))]
+    fn flock_exclusive(_file: &std::fs::File) -> Result<(), Error> {
+        Ok(())
+    }
+
+    #[cfg(not(unix))]
+    fn flock_unlock(_file: &std::fs::File) -> Result<(), Error> {
         Ok(())
     }
 
@@ -440,9 +914,9 @@ impl Jieba {
         if self.da_data.is_empty() {
             return default;
         }
-        let da = DoubleArray::new(&self.da_data[..]);
+        let da = DoubleArray::new(self.da_data.as_slice());
         match da.exact_match_search(word.as_bytes()) {
-            Some(word_id) => self.records[word_id as usize].freq,
+            Some(word_id) => self.record_store.freq(word_id as usize),
             None => default,
         }
     }
@@ -464,7 +938,7 @@ impl Jieba {
             route.resize(str_len + 1, (0.0, 0));
         }
 
-        let da = DoubleArray::new(&self.da_data[..]);
+        let da = DoubleArray::new(self.da_data.as_slice());
         let logtotal = (self.total as f64).ln();
         let mut prev_byte_start = str_len;
         let curr = sentence.char_indices().map(|x| x.0).rev();
@@ -475,7 +949,7 @@ impl Jieba {
                     let wfrag = &sentence[byte_start..byte_end];
 
                     let freq = if let Some(word_id) = da.exact_match_search(wfrag.as_bytes()) {
-                        self.records[word_id as usize].freq
+                        self.record_store.freq(word_id as usize)
                     } else {
                         1
                     };
@@ -497,7 +971,7 @@ impl Jieba {
     }
 
     fn dag(&self, sentence: &str, dag: &mut StaticSparseDAG) {
-        let da = DoubleArray::new(&self.da_data[..]);
+        let da = DoubleArray::new(self.da_data.as_slice());
         for (byte_start, _) in sentence.char_indices().peekable() {
             dag.start(byte_start);
             let haystack = &sentence[byte_start..];
@@ -854,9 +1328,9 @@ impl Jieba {
             .into_iter()
             .map(|word| {
                 if !self.da_data.is_empty() {
-                    let da = DoubleArray::new(&self.da_data[..]);
+                    let da = DoubleArray::new(self.da_data.as_slice());
                     if let Some(word_id) = da.exact_match_search(word.as_bytes()) {
-                        let t = &self.records[word_id as usize].tag;
+                        let t = self.record_store.tag(word_id as usize);
                         return Tag { word, tag: t };
                     }
                 }

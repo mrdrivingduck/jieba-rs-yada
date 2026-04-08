@@ -214,13 +214,13 @@ pub struct Tag<'a> {
 #[derive(Debug, Clone)]
 struct Record {
     freq: usize,
-    tag: String,
+    tag: Box<str>,
     word: String,
 }
 
 impl Record {
     #[inline(always)]
-    fn new(freq: usize, tag: String, word: String) -> Self {
+    fn new(freq: usize, tag: Box<str>, word: String) -> Self {
         Self { freq, tag, word }
     }
 }
@@ -582,7 +582,7 @@ impl Jieba {
                         records[word_id as usize].freq = freq;
                     } else {
                         let word_id = records.len() as u32;
-                        records.push(Record::new(freq, String::from(tag), word.to_string()));
+                        records.push(Record::new(freq, tag.into(), word.to_string()));
                         word_to_id.insert(word.to_string(), word_id);
                     }
                 }

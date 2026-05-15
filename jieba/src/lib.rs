@@ -739,14 +739,48 @@ impl Jieba {
     /// let words = jieba.cut("测试分词", false);
     /// ```
     pub fn load_from_cache<P: AsRef<Path>>(path: P) -> Result<Self, Error> {
-        let path = path.as_ref();
+        Self::load_or_build_cache(path, || Ok(Self::new()))
+    }
 
-        // If cache exists, load it directly
+    /// Load a Jieba instance from a cache file that merges default + user dict.
+    ///
+    /// - If `cache_path` already exists, mmap-load it directly (no lock needed).
+    /// - Otherwise, acquire flock on `{cache_path}.lock`, double-check, and if
+    ///   still missing: build from default dict + `user_dict_content`, save
+    ///   cache atomically, then mmap-load.
+    ///
+    /// `user_dict_content` is the raw text of the user dictionary, one entry
+    /// per line in `word freq [tag]` format (same as `load_dict` input).
+    ///
+    /// The caller is responsible for:
+    /// - Computing the content hash and embedding it in the cache filename
+    ///   (so different dict content -> different cache file).
+    /// - Detecting when the user dict changes and calling this method with
+    ///   the new cache path.
+    pub fn load_from_cache_with_user_dict<P: AsRef<Path>>(
+        cache_path: P,
+        user_dict_content: &str,
+    ) -> Result<Self, Error> {
+        Self::load_or_build_cache(cache_path, || {
+            let mut instance = Self::new();
+            instance.load_dict(&mut std::io::BufReader::new(user_dict_content.as_bytes()))?;
+            Ok(instance)
+        })
+    }
+
+    fn load_or_build_cache<P, F>(cache_path: P, build_fn: F) -> Result<Self, Error>
+    where
+        P: AsRef<Path>,
+        F: FnOnce() -> Result<Self, Error>,
+    {
+        let path = cache_path.as_ref();
+
+        // Fast path: cache already exists
         if path.exists() {
             return Self::mmap_load(path);
         }
 
-        // Cache doesn't exist — coordinate with other processes via file lock
+        // Slow path: coordinate with other processes via file lock
         let lock_path = path.with_extension("lock");
         let lock_file = std::fs::OpenOptions::new()
             .create(true)
@@ -757,21 +791,17 @@ impl Jieba {
                 Error::InvalidDictEntry(format!("failed to open lock file {}: {e}", lock_path.display()))
             })?;
 
-        // Acquire exclusive lock (blocks until available)
         Self::flock_exclusive(&lock_file)?;
 
         // Double-check: another process may have created the cache while we waited
         let result = if path.exists() {
             Self::mmap_load(path)
         } else {
-            // We are the builder — construct and save
-            let instance = Self::new();
+            let instance = build_fn()?;
             instance.save_cache(path)?;
-            // Now mmap-load the file we just wrote
             Self::mmap_load(path)
         };
 
-        // Release lock
         Self::flock_unlock(&lock_file)?;
         drop(lock_file);
 
@@ -1952,6 +1982,92 @@ mod tests {
         let userdict = "出了 not_a_int";
         let ret = jieba.load_dict(&mut BufReader::new(userdict.as_bytes()));
         assert!(ret.is_err());
+    }
+
+    #[test]
+    fn test_load_from_cache_with_user_dict() {
+        let dir = tempfile::tempdir().unwrap();
+        let cache_path = dir.path().join("user_dict.cache");
+
+        let user_dict = "测试新词 10000 n\n自定义词 5000 v";
+        let jieba = Jieba::load_from_cache_with_user_dict(&cache_path, user_dict).unwrap();
+
+        assert!(jieba.has_word("测试新词"));
+        assert!(jieba.has_word("自定义词"));
+        assert!(jieba.has_word("中国"));
+
+        // Second load hits mmap fast path (cache file already exists)
+        assert!(cache_path.exists());
+        let jieba2 = Jieba::load_from_cache_with_user_dict(&cache_path, user_dict).unwrap();
+        assert!(jieba2.has_word("测试新词"));
+        assert!(jieba2.has_word("中国"));
+    }
+
+    #[test]
+    fn test_load_from_cache_with_user_dict_override() {
+        let dir = tempfile::tempdir().unwrap();
+        let cache_path = dir.path().join("override.cache");
+
+        // "中出" has freq 3 in default dict; override with very high freq
+        let user_dict = "中出 100000";
+        let jieba = Jieba::load_from_cache_with_user_dict(&cache_path, user_dict).unwrap();
+
+        let words = jieba.cut("我们中出了一个叛徒", false);
+        assert_eq!(words, vec!["我们", "中出", "了", "一个", "叛徒"]);
+    }
+
+    #[test]
+    fn test_load_from_cache_with_user_dict_tag() {
+        let dir = tempfile::tempdir().unwrap();
+        let cache_path = dir.path().join("tag.cache");
+
+        let user_dict = "测试新词 10000 nz";
+        let jieba = Jieba::load_from_cache_with_user_dict(&cache_path, user_dict).unwrap();
+
+        let tags = jieba.tag("测试新词", false);
+        assert_eq!(tags.len(), 1);
+        assert_eq!(tags[0].word, "测试新词");
+        assert_eq!(tags[0].tag, "nz");
+    }
+
+    #[test]
+    fn test_load_from_cache_with_user_dict_empty() {
+        let dir = tempfile::tempdir().unwrap();
+        let cache_path = dir.path().join("empty_user.cache");
+
+        let jieba = Jieba::load_from_cache_with_user_dict(&cache_path, "").unwrap();
+
+        // Should behave like default dict only
+        assert!(jieba.has_word("中国"));
+        assert!(jieba.has_word("开源"));
+        let words = jieba.cut("我来到北京清华大学", false);
+        assert_eq!(words, vec!["我", "来到", "北京", "清华大学"]);
+    }
+
+    #[test]
+    fn test_load_from_cache_with_user_dict_cut() {
+        let dir = tempfile::tempdir().unwrap();
+        let cache_path = dir.path().join("cut.cache");
+
+        let user_dict = "京华大酒店 10000 n";
+        let jieba = Jieba::load_from_cache_with_user_dict(&cache_path, user_dict).unwrap();
+
+        let words = jieba.cut("京华大酒店的张尧经理", false);
+        assert_eq!(words[0], "京华大酒店");
+    }
+
+    #[test]
+    fn test_load_from_cache_refactored() {
+        let dir = tempfile::tempdir().unwrap();
+        let cache_path = dir.path().join("default.cache");
+
+        let jieba = Jieba::load_from_cache(&cache_path).unwrap();
+        assert!(jieba.has_word("中国"));
+        assert!(jieba.has_word("开源"));
+
+        // Second load from existing cache
+        let jieba2 = Jieba::load_from_cache(&cache_path).unwrap();
+        assert!(jieba2.has_word("中国"));
     }
 
     #[test]

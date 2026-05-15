@@ -35,6 +35,7 @@ regex = { workspace = true }
 codspeed-criterion-compat = { workspace = true }
 wasm-bindgen-test = { workspace = true }
 rayon = { workspace = true }
+tempfile = "3"
 
 [target.'cfg(unix)'.dev-dependencies]
 tikv-jemallocator = "0.6.0"
